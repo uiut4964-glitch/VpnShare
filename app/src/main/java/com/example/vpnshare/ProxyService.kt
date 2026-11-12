@@ -4,14 +4,20 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import java.io.ByteArrayOutputStream
+import java.io.DataInputStream
 import java.io.InputStream
 import java.io.OutputStream
+import java.io.PushbackInputStream
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -21,9 +27,10 @@ import java.util.concurrent.Executors
 class ProxyService : Service() {
     companion object {
         @Volatile var running = false
-        const val PORT = 8080
+        fun savedPort(c: Context): Int = c.getSharedPreferences("s", 0).getInt("port", 8080)
     }
 
+    private var port = 8080
     private var server: ServerSocket? = null
     private val pool = Executors.newCachedThreadPool()
     private var wl: PowerManager.WakeLock? = null
@@ -31,12 +38,13 @@ class ProxyService : Service() {
     override fun onBind(i: Intent?): IBinder? = null
 
     override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+        port = savedPort(this)
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
             NotificationChannel("proxy", "Proxy", NotificationManager.IMPORTANCE_LOW))
         val n = Notification.Builder(this, "proxy")
             .setContentTitle("مشاركة VPN تعمل")
-            .setContentText("المنفذ $PORT")
+            .setContentText("المنفذ $port")
             .setSmallIcon(android.R.drawable.stat_sys_upload)
             .build()
         if (Build.VERSION.SDK_INT >= 34) {
@@ -57,7 +65,7 @@ class ProxyService : Service() {
         try {
             val s = ServerSocket()
             s.reuseAddress = true
-            s.bind(InetSocketAddress("0.0.0.0", PORT))
+            s.bind(InetSocketAddress("0.0.0.0", port))
             server = s
             while (running) {
                 val c = s.accept()
@@ -66,15 +74,27 @@ class ProxyService : Service() {
         } catch (e: Exception) {
         } finally {
             running = false
+            stopSelf()
         }
     }
 
+    // أول بايت: 5 = SOCKS5، غير ذلك = HTTP
     private fun handle(c: Socket) {
-        val r = Socket()
         try {
             c.soTimeout = 30000
-            val cin = c.getInputStream()
-            val cout = c.getOutputStream()
+            val pin = PushbackInputStream(c.getInputStream(), 1)
+            val b = pin.read()
+            if (b < 0) { c.close(); return }
+            pin.unread(b)
+            if (b == 5) socks(c, pin, c.getOutputStream()) else http(c, pin, c.getOutputStream())
+        } catch (e: Exception) {
+            try { c.close() } catch (_: Exception) {}
+        }
+    }
+
+    private fun http(c: Socket, cin: InputStream, cout: OutputStream) {
+        val r = Socket()
+        try {
             val head = readHead(cin) ?: throw Exception("bad head")
             val lines = head.split("\r\n")
             val parts = lines[0].split(" ")
@@ -107,6 +127,110 @@ class ProxyService : Service() {
             try { c.close() } catch (_: Exception) {}
             try { r.close() } catch (_: Exception) {}
         }
+    }
+
+    private fun socks(c: Socket, pin: InputStream, out: OutputStream) {
+        val d = DataInputStream(pin)
+        d.readByte()
+        d.readFully(ByteArray(d.readUnsignedByte()))
+        out.write(byteArrayOf(5, 0))
+        out.flush()
+        val h = ByteArray(4)
+        d.readFully(h)
+        val cmd = h[1].toInt()
+        val host = when (h[3].toInt()) {
+            1 -> { val a = ByteArray(4); d.readFully(a); InetAddress.getByAddress(a).hostAddress.orEmpty() }
+            3 -> { val a = ByteArray(d.readUnsignedByte()); d.readFully(a); String(a) }
+            4 -> { val a = ByteArray(16); d.readFully(a); InetAddress.getByAddress(a).hostAddress.orEmpty() }
+            else -> throw Exception("atyp")
+        }
+        val port = d.readUnsignedShort()
+        when (cmd) {
+            1 -> {
+                val r = Socket()
+                try {
+                    r.connect(InetSocketAddress(host, port), 15000)
+                } catch (e: Exception) {
+                    out.write(byteArrayOf(5, 5, 0, 1, 0, 0, 0, 0, 0, 0))
+                    out.flush()
+                    r.close()
+                    throw e
+                }
+                out.write(byteArrayOf(5, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+                out.flush()
+                c.soTimeout = 0
+                pool.execute { pipe(r.getInputStream(), out, c, r) }
+                pipe(pin, r.getOutputStream(), c, r)
+            }
+            3 -> udp(c, pin, out)
+            else -> {
+                out.write(byteArrayOf(5, 7, 0, 1, 0, 0, 0, 0, 0, 0))
+                out.flush()
+                throw Exception("cmd")
+            }
+        }
+    }
+
+    // SOCKS5 UDP ASSOCIATE
+    private fun udp(c: Socket, pin: InputStream, out: OutputStream) {
+        val u = DatagramSocket(0)
+        val la = c.localAddress.address
+        val ip = if (la.size == 4) la else ByteArray(4)
+        out.write(byteArrayOf(5, 0, 0, 1) + ip +
+            byteArrayOf((u.localPort shr 8).toByte(), u.localPort.toByte()))
+        out.flush()
+        c.soTimeout = 0
+        val client = c.inetAddress
+        var cport = 0
+        pool.execute {
+            try {
+                val buf = ByteArray(65535)
+                while (true) {
+                    val p = DatagramPacket(buf, buf.size)
+                    u.receive(p)
+                    try {
+                        if (p.address == client && (cport == 0 || p.port == cport)) {
+                            cport = p.port
+                            val d = buf.copyOf(p.length)
+                            if (d.size > 10 && d[2].toInt() == 0) {
+                                var o: Int
+                                val dst: InetAddress? = when (d[3].toInt()) {
+                                    1 -> { o = 8; InetAddress.getByAddress(d.copyOfRange(4, 8)) }
+                                    3 -> {
+                                        val l = d[4].toInt() and 255
+                                        o = 5 + l
+                                        InetAddress.getByName(String(d, 5, l))
+                                    }
+                                    4 -> { o = 20; InetAddress.getByAddress(d.copyOfRange(4, 20)) }
+                                    else -> { o = 0; null }
+                                }
+                                if (dst != null) {
+                                    val dp = ((d[o].toInt() and 255) shl 8) or (d[o + 1].toInt() and 255)
+                                    u.send(DatagramPacket(d, o + 2, d.size - o - 2, dst, dp))
+                                }
+                            }
+                        } else if (cport != 0) {
+                            val ra = p.address.address
+                            val hdr = byteArrayOf(0, 0, 0, if (ra.size == 4) 1 else 4) + ra +
+                                byteArrayOf((p.port shr 8).toByte(), p.port.toByte())
+                            val resp = hdr + buf.copyOf(p.length)
+                            u.send(DatagramPacket(resp, resp.size, client, cport))
+                        }
+                    } catch (e: Exception) {
+                    }
+                }
+            } catch (e: Exception) {
+            } finally {
+                u.close()
+            }
+        }
+        try {
+            val t = ByteArray(256)
+            while (pin.read(t) >= 0) { }
+        } catch (e: Exception) {
+        }
+        u.close()
+        c.close()
     }
 
     private fun readHead(i: InputStream): String? {
