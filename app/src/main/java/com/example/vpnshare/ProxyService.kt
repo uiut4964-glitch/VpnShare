@@ -27,6 +27,10 @@ import java.util.concurrent.Executors
 class ProxyService : Service() {
     companion object {
         @Volatile var running = false
+        val tcpCount = java.util.concurrent.atomic.AtomicLong()
+        val udpAssoc = java.util.concurrent.atomic.AtomicLong()
+        val udpOut = java.util.concurrent.atomic.AtomicLong()
+        val udpIn = java.util.concurrent.atomic.AtomicLong()
         fun savedPort(c: Context): Int = c.getSharedPreferences("s", 0).getInt("port", 8080)
     }
 
@@ -133,7 +137,7 @@ class ProxyService : Service() {
                 r.getOutputStream().flush()
             }
             c.soTimeout = 0
-            pool.execute { pipe(r, c, customOut = cout) }
+            tcpCount.incrementAndGet(); pool.execute { pipe(r, c, customOut = cout) }
             pipe(c, r, customIn = cin)
         } catch (_: Exception) {
             try { c.close() } catch (_: Exception) {}
@@ -186,7 +190,7 @@ class ProxyService : Service() {
                     out.write(byteArrayOf(5, 0, 0, 1, 0, 0, 0, 0, 0, 0))
                     out.flush()
                     c.soTimeout = 0
-                    pool.execute { pipe(r, c, customOut = out) }
+                    tcpCount.incrementAndGet(); pool.execute { pipe(r, c, customOut = out) }
                     pipe(c, r, customIn = pin)
                 }
                 3 -> udp(c, pin, out)
@@ -205,7 +209,7 @@ class ProxyService : Service() {
 
     // SOCKS5 UDP ASSOCIATE
     private fun udp(c: Socket, pin: InputStream, out: OutputStream) {
-        val u = DatagramSocket(0)
+        val u = DatagramSocket(0); udpAssoc.incrementAndGet()
         try {
             val la = c.localAddress.address
             val ip = if (la.size == 4) la else ByteArray(4)
@@ -250,7 +254,7 @@ class ProxyService : Service() {
                                     }
                                     if (dst != null && d.size >= o + 2) {
                                         val dp = ((d[o].toInt() and 255) shl 8) or (d[o + 1].toInt() and 255)
-                                        u.send(DatagramPacket(d, o + 2, d.size - o - 2, dst, dp))
+                                        u.send(DatagramPacket(d, o + 2, d.size - o - 2, dst, dp)); udpOut.incrementAndGet()
                                     }
                                 }
                             } else if (cport != 0) {
@@ -258,7 +262,7 @@ class ProxyService : Service() {
                                 val hdr = byteArrayOf(0, 0, 0, if (ra.size == 4) 1 else 4) + ra +
                                     byteArrayOf((p.port shr 8).toByte(), p.port.toByte())
                                 val resp = hdr + buf.copyOf(p.length)
-                                u.send(DatagramPacket(resp, resp.size, client, cport))
+                                u.send(DatagramPacket(resp, resp.size, client, cport)); udpIn.incrementAndGet()
                             }
                         } catch (_: Exception) {
                         }
