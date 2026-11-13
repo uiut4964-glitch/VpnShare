@@ -41,7 +41,8 @@ class ProxyService : Service() {
         port = savedPort(this)
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
-            NotificationChannel("proxy", "Proxy", NotificationManager.IMPORTANCE_LOW))
+            NotificationChannel("proxy", "Proxy", NotificationManager.IMPORTANCE_LOW)
+        )
         val n = Notification.Builder(this, "proxy")
             .setContentTitle("مشاركة VPN تعمل")
             .setContentText("المنفذ $port")
@@ -71,7 +72,7 @@ class ProxyService : Service() {
                 val c = s.accept()
                 pool.execute { handle(c) }
             }
-        } catch (e: Exception) {
+        } catch (_: Exception) {
         } finally {
             running = false
             stopSelf()
@@ -84,10 +85,17 @@ class ProxyService : Service() {
             c.soTimeout = 30000
             val pin = PushbackInputStream(c.getInputStream(), 1)
             val b = pin.read()
-            if (b < 0) { c.close(); return }
+            if (b < 0) {
+                try { c.close() } catch (_: Exception) {}
+                return
+            }
             pin.unread(b)
-            if (b == 5) socks(c, pin, c.getOutputStream()) else http(c, pin, c.getOutputStream())
-        } catch (e: Exception) {
+            if (b == 5) {
+                socks(c, pin, c.getOutputStream())
+            } else {
+                http(c, pin, c.getOutputStream())
+            }
+        } catch (_: Exception) {
             try { c.close() } catch (_: Exception) {}
         }
     }
@@ -115,122 +123,159 @@ class ProxyService : Service() {
                 val sb = StringBuilder("$method $path $ver\r\n")
                 for (l in lines.drop(1)) {
                     if (l.isNotEmpty() && !l.startsWith("Proxy-", true) &&
-                        !l.startsWith("Connection:", true)) sb.append(l).append("\r\n")
+                        !l.startsWith("Connection:", true)
+                    ) {
+                        sb.append(l).append("\r\n")
+                    }
                 }
                 sb.append("Connection: close\r\n\r\n")
                 r.getOutputStream().write(sb.toString().toByteArray(Charsets.ISO_8859_1))
+                r.getOutputStream().flush()
             }
             c.soTimeout = 0
-            pool.execute { pipe(r.getInputStream(), cout, c, r) }
-            pipe(cin, r.getOutputStream(), c, r)
-        } catch (e: Exception) {
+            pool.execute { pipe(r, c, customOut = cout) }
+            pipe(c, r, customIn = cin)
+        } catch (_: Exception) {
             try { c.close() } catch (_: Exception) {}
             try { r.close() } catch (_: Exception) {}
         }
     }
 
     private fun socks(c: Socket, pin: InputStream, out: OutputStream) {
-        val d = DataInputStream(pin)
-        d.readByte()
-        d.readFully(ByteArray(d.readUnsignedByte()))
-        out.write(byteArrayOf(5, 0))
-        out.flush()
-        val h = ByteArray(4)
-        d.readFully(h)
-        val cmd = h[1].toInt()
-        val host = when (h[3].toInt()) {
-            1 -> { val a = ByteArray(4); d.readFully(a); InetAddress.getByAddress(a).hostAddress.orEmpty() }
-            3 -> { val a = ByteArray(d.readUnsignedByte()); d.readFully(a); String(a) }
-            4 -> { val a = ByteArray(16); d.readFully(a); InetAddress.getByAddress(a).hostAddress.orEmpty() }
-            else -> throw Exception("atyp")
-        }
-        val port = d.readUnsignedShort()
-        when (cmd) {
-            1 -> {
-                val r = Socket()
-                try {
-                    r.connect(InetSocketAddress(host, port), 15000)
-                } catch (e: Exception) {
-                    out.write(byteArrayOf(5, 5, 0, 1, 0, 0, 0, 0, 0, 0))
-                    out.flush()
-                    r.close()
-                    throw e
+        try {
+            val d = DataInputStream(pin)
+            d.readByte()
+            d.readFully(ByteArray(d.readUnsignedByte()))
+            out.write(byteArrayOf(5, 0))
+            out.flush()
+            val h = ByteArray(4)
+            d.readFully(h)
+            val cmd = h[1].toInt()
+            val host = when (h[3].toInt()) {
+                1 -> {
+                    val a = ByteArray(4)
+                    d.readFully(a)
+                    InetAddress.getByAddress(a).hostAddress.orEmpty()
                 }
-                out.write(byteArrayOf(5, 0, 0, 1, 0, 0, 0, 0, 0, 0))
-                out.flush()
-                c.soTimeout = 0
-                pool.execute { pipe(r.getInputStream(), out, c, r) }
-                pipe(pin, r.getOutputStream(), c, r)
+                3 -> {
+                    val a = ByteArray(d.readUnsignedByte())
+                    d.readFully(a)
+                    String(a)
+                }
+                4 -> {
+                    val a = ByteArray(16)
+                    d.readFully(a)
+                    InetAddress.getByAddress(a).hostAddress.orEmpty()
+                }
+                else -> throw Exception("atyp")
             }
-            3 -> udp(c, pin, out)
-            else -> {
-                out.write(byteArrayOf(5, 7, 0, 1, 0, 0, 0, 0, 0, 0))
-                out.flush()
-                throw Exception("cmd")
+            val port = d.readUnsignedShort()
+            when (cmd) {
+                1 -> {
+                    val r = Socket()
+                    try {
+                        r.connect(InetSocketAddress(host, port), 15000)
+                    } catch (e: Exception) {
+                        try {
+                            out.write(byteArrayOf(5, 5, 0, 1, 0, 0, 0, 0, 0, 0))
+                            out.flush()
+                        } catch (_: Exception) {}
+                        try { r.close() } catch (_: Exception) {}
+                        throw e
+                    }
+                    out.write(byteArrayOf(5, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+                    out.flush()
+                    c.soTimeout = 0
+                    pool.execute { pipe(r, c, customOut = out) }
+                    pipe(c, r, customIn = pin)
+                }
+                3 -> udp(c, pin, out)
+                else -> {
+                    try {
+                        out.write(byteArrayOf(5, 7, 0, 1, 0, 0, 0, 0, 0, 0))
+                        out.flush()
+                    } catch (_: Exception) {}
+                    throw Exception("cmd")
+                }
             }
+        } catch (_: Exception) {
+            try { c.close() } catch (_: Exception) {}
         }
     }
 
     // SOCKS5 UDP ASSOCIATE
     private fun udp(c: Socket, pin: InputStream, out: OutputStream) {
         val u = DatagramSocket(0)
-        val la = c.localAddress.address
-        val ip = if (la.size == 4) la else ByteArray(4)
-        out.write(byteArrayOf(5, 0, 0, 1) + ip +
-            byteArrayOf((u.localPort shr 8).toByte(), u.localPort.toByte()))
-        out.flush()
-        c.soTimeout = 0
-        val client = c.inetAddress
-        var cport = 0
-        pool.execute {
-            try {
-                val buf = ByteArray(65535)
-                while (true) {
-                    val p = DatagramPacket(buf, buf.size)
-                    u.receive(p)
-                    try {
-                        if (p.address == client && (cport == 0 || p.port == cport)) {
-                            cport = p.port
-                            val d = buf.copyOf(p.length)
-                            if (d.size > 10 && d[2].toInt() == 0) {
-                                var o: Int
-                                val dst: InetAddress? = when (d[3].toInt()) {
-                                    1 -> { o = 8; InetAddress.getByAddress(d.copyOfRange(4, 8)) }
-                                    3 -> {
-                                        val l = d[4].toInt() and 255
-                                        o = 5 + l
-                                        InetAddress.getByName(String(d, 5, l))
-                                    }
-                                    4 -> { o = 20; InetAddress.getByAddress(d.copyOfRange(4, 20)) }
-                                    else -> { o = 0; null }
-                                }
-                                if (dst != null) {
-                                    val dp = ((d[o].toInt() and 255) shl 8) or (d[o + 1].toInt() and 255)
-                                    u.send(DatagramPacket(d, o + 2, d.size - o - 2, dst, dp))
-                                }
-                            }
-                        } else if (cport != 0) {
-                            val ra = p.address.address
-                            val hdr = byteArrayOf(0, 0, 0, if (ra.size == 4) 1 else 4) + ra +
-                                byteArrayOf((p.port shr 8).toByte(), p.port.toByte())
-                            val resp = hdr + buf.copyOf(p.length)
-                            u.send(DatagramPacket(resp, resp.size, client, cport))
-                        }
-                    } catch (e: Exception) {
-                    }
-                }
-            } catch (e: Exception) {
-            } finally {
-                u.close()
-            }
-        }
         try {
+            val la = c.localAddress.address
+            val ip = if (la.size == 4) la else ByteArray(4)
+            out.write(
+                byteArrayOf(5, 0, 0, 1) + ip +
+                    byteArrayOf((u.localPort shr 8).toByte(), u.localPort.toByte())
+            )
+            out.flush()
+            c.soTimeout = 0
+            val client = c.inetAddress
+            var cport = 0
+            pool.execute {
+                try {
+                    val buf = ByteArray(65535)
+                    while (running && !u.isClosed && !c.isClosed) {
+                        val p = DatagramPacket(buf, buf.size)
+                        u.receive(p)
+                        try {
+                            if (p.address == client && (cport == 0 || p.port == cport)) {
+                                cport = p.port
+                                val d = buf.copyOf(p.length)
+                                if (d.size > 10 && d[2].toInt() == 0) {
+                                    var o: Int
+                                    val dst: InetAddress? = when (d[3].toInt()) {
+                                        1 -> {
+                                            o = 8
+                                            if (d.size >= 10) InetAddress.getByAddress(d.copyOfRange(4, 8)) else null
+                                        }
+                                        3 -> {
+                                            val l = d[4].toInt() and 255
+                                            o = 5 + l
+                                            if (d.size >= o + 2) InetAddress.getByName(String(d, 5, l)) else null
+                                        }
+                                        4 -> {
+                                            o = 20
+                                            if (d.size >= 22) InetAddress.getByAddress(d.copyOfRange(4, 20)) else null
+                                        }
+                                        else -> {
+                                            o = 0
+                                            null
+                                        }
+                                    }
+                                    if (dst != null && d.size >= o + 2) {
+                                        val dp = ((d[o].toInt() and 255) shl 8) or (d[o + 1].toInt() and 255)
+                                        u.send(DatagramPacket(d, o + 2, d.size - o - 2, dst, dp))
+                                    }
+                                }
+                            } else if (cport != 0) {
+                                val ra = p.address.address
+                                val hdr = byteArrayOf(0, 0, 0, if (ra.size == 4) 1 else 4) + ra +
+                                    byteArrayOf((p.port shr 8).toByte(), p.port.toByte())
+                                val resp = hdr + buf.copyOf(p.length)
+                                u.send(DatagramPacket(resp, resp.size, client, cport))
+                            }
+                        } catch (_: Exception) {
+                        }
+                    }
+                } catch (_: Exception) {
+                } finally {
+                    try { u.close() } catch (_: Exception) {}
+                }
+            }
             val t = ByteArray(256)
-            while (pin.read(t) >= 0) { }
-        } catch (e: Exception) {
+            while (pin.read(t) >= 0) {
+            }
+        } catch (_: Exception) {
+        } finally {
+            try { u.close() } catch (_: Exception) {}
+            try { c.close() } catch (_: Exception) {}
         }
-        u.close()
-        c.close()
     }
 
     private fun readHead(i: InputStream): String? {
@@ -251,8 +296,10 @@ class ProxyService : Service() {
         return null
     }
 
-    private fun pipe(i: InputStream, o: OutputStream, a: Socket, b: Socket) {
+    private fun pipe(src: Socket, dst: Socket, customIn: InputStream? = null, customOut: OutputStream? = null) {
         try {
+            val i = customIn ?: src.getInputStream()
+            val o = customOut ?: dst.getOutputStream()
             val buf = ByteArray(16384)
             while (true) {
                 val n = i.read(buf)
@@ -260,18 +307,20 @@ class ProxyService : Service() {
                 o.write(buf, 0, n)
                 o.flush()
             }
-        } catch (e: Exception) {
+        } catch (_: Exception) {
         } finally {
-            try { a.close() } catch (_: Exception) {}
-            try { b.close() } catch (_: Exception) {}
+            try { src.close() } catch (_: Exception) {}
+            try { dst.close() } catch (_: Exception) {}
         }
     }
 
     override fun onDestroy() {
         running = false
         try { server?.close() } catch (_: Exception) {}
-        try { wl?.release() } catch (_: Exception) {}
-        pool.shutdown()
+        try {
+            if (wl?.isHeld == true) wl?.release()
+        } catch (_: Exception) {}
+        pool.shutdownNow()
         super.onDestroy()
     }
 }
