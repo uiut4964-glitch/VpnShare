@@ -32,6 +32,7 @@ class ProxyService : Service() {
         val udpOut = java.util.concurrent.atomic.AtomicLong()
         val udpIn = java.util.concurrent.atomic.AtomicLong()
         fun savedPort(c: Context): Int = c.getSharedPreferences("s", 0).getInt("port", 8080)
+        fun buildConfig(ip: String, port: Int): String = """{"log":{"level":"info"},"dns":{"servers":[{"tag":"dns-remote","type":"tcp","server":"8.8.8.8","detour":"phone"}],"final":"dns-remote"},"inbounds":[{"type":"tun","tag":"tun-in","address":["172.19.0.1/30"],"auto_route":true,"stack":"mixed"}],"outbounds":[{"type":"socks","tag":"phone","server":"$ip","server_port":$port,"version":"5"},{"type":"direct","tag":"direct"}],"route":{"rules":[{"action":"sniff"},{"protocol":"dns","action":"hijack-dns"}],"final":"phone","auto_detect_interface":true}}"""
     }
 
     private var port = 8080
@@ -113,6 +114,15 @@ class ProxyService : Service() {
             val method = parts[0]
             val target = parts[1]
             val ver = parts[2]
+            if (target.startsWith("/")) {
+                val body = buildConfig(c.localAddress.hostAddress.orEmpty(), port).toByteArray()
+                cout.write(("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${body.size}\r\nConnection: close\r\n\r\n").toByteArray())
+                cout.write(body)
+                cout.flush()
+                try { r.close() } catch (_: Exception) {}
+                c.close()
+                return
+            }
             if (method == "CONNECT") {
                 val host = target.substringBeforeLast(":").trim('[', ']')
                 val port = target.substringAfterLast(":").toInt()
