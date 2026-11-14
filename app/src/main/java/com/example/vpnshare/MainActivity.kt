@@ -100,16 +100,13 @@ class MainActivity : Activity() {
                 startActivity(Intent.createChooser(i, "مشاركة الإعداد"))
             }
         })
-        root.addView(btn("QR: نص الإعداد") {
-            ipPort()?.let { showQr("QR: نص الإعداد", ProxyService.buildConfig(it.first, it.second)) }
-        })
-        root.addView(btn("QR: رابط استيراد (تجريبي)") {
+        root.addView(btn("QR للآيباد (sing-box)") {
             ipPort()?.let {
                 if (!ProxyService.running) {
                     Toast.makeText(this, "شغّل مفتاح المشاركة أولاً ليعمل الرابط", Toast.LENGTH_LONG).show()
                 }
                 val u = URLEncoder.encode("http://${it.first}:${it.second}/config.json", "UTF-8")
-                showQr("QR: رابط استيراد", "sing-box://import-remote-profile?url=$u#Phone")
+                showQr("في sing-box: + ثم Scan QR Code", "sing-box://import-remote-profile?url=$u#Phone")
             }
         })
         root.addView(btn("اختبار UDP عبر الـ VPN") {
